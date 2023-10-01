@@ -141,7 +141,8 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
             self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
 
-        self.obj_token_idx = kwargs.pop("obj_token_idx")
+        # self.obj_token_idx = kwargs.pop("obj_token_idx")
+        self.action_token_idx = kwargs.pop("action_token_idx")
 
         super().__init__(config)
 
@@ -157,17 +158,12 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             with torch.autocast(device_type="cuda"):
                 image_embeddings_list = []
                 for batch_idx in range(len(images)):
-                    # cur_image_embedding = []
-                    # find the images corresponding to interaction actions
                     for i in obj_positions[batch_idx]:
-                        # target_images.append(images[batch_idx][i])
                         torch.cuda.empty_cache()
-                        # print("image size: ", images[batch_idx][i].size())
                         sam_image = F.interpolate(images[batch_idx][i].unsqueeze(0), size=(1024, 1024), mode="bilinear")
                         image_embeddings = self.model.visual_model.image_encoder(sam_image)
                         image_embeddings_list.append(image_embeddings)
                         torch.cuda.empty_cache()
-                    # image_embeddings_list.append(cur_image_embedding)
         return image_embeddings_list
  
     def forward(self, **kwargs): 
@@ -179,6 +175,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         self,
         images,
         orig_images,
+        tokenizer,
         input_ids: torch.LongTensor,
         labels: Optional[torch.LongTensor] = None,
         obj_positions: List[List[int]] = None, # 要预测的物体mask在当前任务的第几个动作
@@ -194,9 +191,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
     ):
         # copyied from llava_llama.py
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        output_hidden_states = (output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_embeddings_list = self.get_visual_embs(orig_images, obj_positions)
@@ -234,26 +229,24 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             output = None
 
         else:
-            output, original_labels = super().forward(
+            output, shift_labels = super().forward(
                 images=images,
                 attention_mask=attention_mask,
                 input_ids=input_ids,
                 labels=labels,
                 output_hidden_states=True,
             )
-            output_hidden_states = output.hidden_states[-1] # (batch_size, seq_len, hidden_size)
+            output_hidden_states = output.hidden_states[-1][:, :-1, :] # (batch_size, seq_len-1, hidden_size)
 
-
-        # hidden_states = []
         assert len(self.model.text_hidden_fcs) == 1
         pred_embeddings = self.model.text_hidden_fcs[0](output_hidden_states)
 
-        obj_token_mask = original_labels[:, :] == self.obj_token_idx
         pred_embeddings_ = []
         for batch_idx in range(batch_size):
-            for i in range(original_labels.size()[1]):
-                if obj_token_mask[batch_idx, i]:
-                    pred_embeddings_.append(pred_embeddings[batch_idx, i])
+            for i in range(shift_labels.size()[1]):
+                if shift_labels[batch_idx][i] in self.action_token_idx:
+                    # print("action_token_id: ", shift_labels[batch_idx][i])
+                    pred_embeddings_.append(pred_embeddings[batch_idx][i])
         pred_embeddings = pred_embeddings_
 
         multimask_output = False

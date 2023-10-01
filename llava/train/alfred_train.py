@@ -305,7 +305,6 @@ def preprocess_alfred(
 
     input_ids, targets = [], []
     goal, instr = "[GOAL]\n" + sources['goal'].strip() + "[/GOAL]\n", "[INST]\n" + "".join(sources['instr']) + "[/INST]\n"
-    # targets.extend(len(tokenizer("[GOAL]\n").input_ids) * [IGNORE_INDEX])
     input_ids.extend(tokenizer(goal).input_ids)
     input_ids.extend(tokenizer(instr).input_ids)
     mask_len_1 = len(input_ids)
@@ -313,15 +312,20 @@ def preprocess_alfred(
     act_img_seq = sources['act_img_seq'].replace("<HereForImage>", DEFAULT_IMAGE_TOKEN).strip()
     parts = act_img_seq.split(DEFAULT_IMAGE_TOKEN)
     for part in parts[:-1]:
-        input_ids.extend(tokenizer(part).input_ids)
-        input_ids.append(IMAGE_TOKEN_INDEX)
-    input_ids.extend(tokenizer(parts[-1]).input_ids)
-    mask_len_2 = len(input_ids)
-    input_ids.extend(tokenizer("</s>").input_ids)
+        # remove other sub-parts other than action, including object, </s>
+        subparts = part.split(" ")
+        if len(subparts) > 1:
+            input_ids.extend(tokenizer(subparts[0]).input_ids)
+            input_ids.extend(tokenizer("<Img>").input_ids)
+        else:
+            input_ids.extend(tokenizer(part).input_ids)
+        input_ids.append(IMAGE_TOKEN_INDEX)   
+    input_ids.extend(tokenizer("</Img>StopAction").input_ids)
 
     # prepare targets
     targets = copy.deepcopy(input_ids)
-
+    # Mask targets (mask goal+instr part)
+    targets[:mask_len_1] = [IGNORE_INDEX] * mask_len_1
     # Mask targets (process <Img> and </Img>)
     img_token_indices = [i for i, token_id in enumerate(targets) if token_id == IMAGE_TOKEN_INDEX]
     snippet_1_length = len(tokenizer("<Img>").input_ids)
@@ -330,10 +334,6 @@ def preprocess_alfred(
         targets[img_token_id - snippet_1_length : img_token_id] = [IGNORE_INDEX] * snippet_1_length
         targets[img_token_id + 1 : (img_token_id + snippet_2_length + 1)] = [IGNORE_INDEX] * snippet_2_length
     
-    # Mask targets (process goal+instr and </s>)
-    targets[:mask_len_1] = [IGNORE_INDEX] * mask_len_1
-    targets[mask_len_2:] = [IGNORE_INDEX] * len(tokenizer("</s>").input_ids)
-
     input_ids = [int(x) for x in input_ids]
     targets = [int(x) for x in targets]
     return torch.tensor(input_ids, dtype=torch.long), torch.tensor(targets, dtype=torch.long)
@@ -396,6 +396,7 @@ class DataCollatorForSupervisedDataset(object):
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor|List[List]]:
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
+        # print("labels[0]:  ", labels[0])
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids,
             batch_first=True,
@@ -417,6 +418,7 @@ class DataCollatorForSupervisedDataset(object):
             batch["obj_positions"].append(instance["obj_positions"])
             batch["obj_bboxes"].append(instance["obj_bboxes"])
             batch["obj_masks"].append(instance["obj_masks"])
+        batch['tokenizer'] = self.tokenizer
         return batch
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
@@ -469,8 +471,23 @@ def train():
             use_fast=False,
         )
     tokenizer.pad_token = tokenizer.unk_token
-    num_added_tokens = tokenizer.add_tokens("<obj>")
-    model_args.obj_token_idx = tokenizer("<obj>", add_special_tokens=False).input_ids[0]
+    # encode each action as a special token and add into the tokenizer vocabulary
+    interaction_action_tokens =["OpenObject", "CloseObject", "PickupObject", "PutObject", "ToggleObjectOn", "ToggleObjectOff", "SliceObject"]
+    num_added_tokens = tokenizer.add_tokens(interaction_action_tokens)
+    navi_action_tokens = ["MoveAhead", "RotateRight", "RotateLeft", "LookUp", "LookDown"]
+    num_added_tokens = tokenizer.add_tokens(navi_action_tokens)
+    stop_action_tokens = "StopAction"
+    num_added_tokens = tokenizer.add_tokens(stop_action_tokens)
+    # print("num_added_tokens:   ", num_added_tokens)
+    # exit()
+    # assert num_added_tokens == 13, "wrong number of special tokens"
+    interaction_action_token_idx = []
+    for token in interaction_action_tokens:
+        interaction_action_token_idx.append(tokenizer(token, add_special_tokens=False).input_ids[0])
+    model_args.action_token_idx = interaction_action_token_idx
+    # print(action)
+    # num_added_tokens = tokenizer.add_tokens("<obj>")
+    # model_args.obj_token_idx = tokenizer("<obj>", add_special_tokens=False).input_ids[0]
 
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
@@ -481,7 +498,8 @@ def train():
         "ce_loss_weight": 1.0,
         "dice_loss_weight": 0.5,
         "bce_loss_weight": 2.0,
-        "obj_token_idx": model_args.obj_token_idx,
+        "action_token_idx" : model_args.action_token_idx,
+        # "obj_token_idx": model_args.obj_token_idx,
         "vision_pretrained": "./checkpoints/sam_vit_h_4b8939.pth",
     }
     model = LISAForCausalLM.from_pretrained(model_args.model_name_or_path, torch_dtype=compute_dtype, low_cpu_mem_usage=True, **lisa_model_args)
