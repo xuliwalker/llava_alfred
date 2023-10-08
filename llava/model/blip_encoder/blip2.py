@@ -67,7 +67,10 @@ class Blip2Base(BaseModel):
             img_size, drop_path_rate, use_grad_checkpoint, precision
         )
 
+        ckp = torch.load("/home/xuli/llava_alfred/checkpoints/ln_vision.pth")
         ln_vision = LayerNorm(visual_encoder.num_features)
+        ln_vision.load_state_dict(ckp)
+
         return visual_encoder, ln_vision
 
     def load_from_pretrained(self, url_or_filename):
